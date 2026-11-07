@@ -25,6 +25,7 @@ need to change it, and if you break it the judge can't talk to your bot.
 """
 
 import os
+import json
 import traceback
 
 import uvicorn
@@ -73,7 +74,137 @@ def _suit(c: int) -> int:
 
 
 # --------------------------------------------------------------------------
-# Preflop hand strength evaluation (fast, no simulation needed)
+# Preflop Neural Model Loader & Predictor
+# --------------------------------------------------------------------------
+
+def _extract_preflop_features(hole: tuple[int, ...]) -> list[float]:
+    """Extract 22 numerical features for a 5-card preflop hand."""
+    from collections import Counter
+    ranks = sorted([c >> 2 for c in hole], reverse=True)
+    suits = [c & 3 for c in hole]
+    
+    rank_counts = Counter(ranks)
+    pairs = sum(1 for c in rank_counts.values() if c == 2)
+    trips = sum(1 for c in rank_counts.values() if c == 3)
+    quads = sum(1 for c in rank_counts.values() if c >= 4)
+    
+    suit_counts = sorted(Counter(suits).values(), reverse=True)
+    while len(suit_counts) < 4:
+        suit_counts.append(0)
+    
+    suits_with_ge_2 = sum(1 for c in suit_counts if c >= 2)
+    is_double_suited = 1.0 if suits_with_ge_2 >= 2 else 0.0
+    
+    suit_to_cards = {}
+    for c in hole:
+        s = c & 3
+        suit_to_cards.setdefault(s, []).append(c >> 2)
+    
+    has_nut_flush_draw = 0.0
+    has_second_nut_flush_draw = 0.0
+    for s, s_ranks in suit_to_cards.items():
+        if len(s_ranks) >= 2:
+            if 8 in s_ranks:
+                has_nut_flush_draw = 1.0
+            elif 7 in s_ranks:
+                has_second_nut_flush_draw = 1.0
+                
+    distinct_ranks = sorted(set(ranks))
+    conn_adjacent = 0
+    conn_onegap = 0
+    for i in range(len(distinct_ranks) - 1):
+        gap = distinct_ranks[i + 1] - distinct_ranks[i]
+        if gap == 1:
+            conn_adjacent += 1
+        elif gap == 2:
+            conn_onegap += 1
+    wheel_wrap = 1.0 if (8 in distinct_ranks and 0 in distinct_ranks) else 0.0
+    
+    aces = ranks.count(8)
+    kings = ranks.count(7)
+    queens = ranks.count(6)
+    jacks = ranks.count(5)
+    
+    avg_rank = sum(ranks) / 5.0
+    
+    return [
+        avg_rank / 8.0,
+        aces / 4.0, kings / 4.0, queens / 4.0, jacks / 4.0,
+        pairs / 2.0, float(trips), float(quads),
+        suit_counts[0] / 5.0, suit_counts[1] / 5.0,
+        is_double_suited,
+        has_nut_flush_draw,
+        has_second_nut_flush_draw,
+        conn_adjacent / 4.0,
+        conn_onegap / 4.0,
+        wheel_wrap,
+        len(distinct_ranks) / 5.0,
+        ranks[0] / 8.0, ranks[1] / 8.0, ranks[2] / 8.0, ranks[3] / 8.0, ranks[4] / 8.0
+    ]
+
+_PREFLOP_MODEL = None
+
+def _load_preflop_model():
+    global _PREFLOP_MODEL
+    try:
+        model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "preflop_model.json")
+        if os.path.exists(model_path):
+            with open(model_path, "r") as f:
+                d = json.load(f)
+            try:
+                import numpy as np
+                _PREFLOP_MODEL = {
+                    "W1": np.array(d["W1"], dtype=np.float32),
+                    "b1": np.array(d["b1"], dtype=np.float32),
+                    "W2": np.array(d["W2"], dtype=np.float32).reshape(-1, 1),
+                    "b2": np.float32(d["b2"]),
+                    "use_numpy": True,
+                }
+            except Exception:
+                _PREFLOP_MODEL = {
+                    "W1": d["W1"],
+                    "b1": d["b1"],
+                    "W2": d["W2"],
+                    "b2": d["b2"],
+                    "use_numpy": False,
+                }
+    except Exception:
+        _PREFLOP_MODEL = None
+
+_load_preflop_model()
+
+def _predict_preflop_equity(hole_cards: tuple) -> float:
+    """Predict preflop equity using the trained 2-layer neural network."""
+    if _PREFLOP_MODEL is None:
+        return _preflop_strength(hole_cards)
+    try:
+        feat = _extract_preflop_features(hole_cards)
+        if _PREFLOP_MODEL["use_numpy"]:
+            import numpy as np
+            x = np.array(feat, dtype=np.float32)
+            h1 = np.maximum(0.0, x.dot(_PREFLOP_MODEL["W1"]) + _PREFLOP_MODEL["b1"])
+            out = float((h1.dot(_PREFLOP_MODEL["W2"]) + _PREFLOP_MODEL["b2"])[0])
+        else:
+            W1 = _PREFLOP_MODEL["W1"]
+            b1 = _PREFLOP_MODEL["b1"]
+            W2 = _PREFLOP_MODEL["W2"]
+            b2 = _PREFLOP_MODEL["b2"]
+            hidden = [0.0] * len(b1)
+            for j in range(len(b1)):
+                val = b1[j]
+                for i in range(len(feat)):
+                    val += feat[i] * W1[i][j]
+                hidden[j] = val if val > 0.0 else 0.0
+            out = b2
+            for j in range(len(hidden)):
+                out += hidden[j] * W2[j]
+        return max(0.15, min(0.85, out))
+    except Exception:
+        return _preflop_strength(hole_cards)
+
+
+# --------------------------------------------------------------------------
+# Preflop hand strength evaluation (fast heuristic fallback)
 # --------------------------------------------------------------------------
 
 def _preflop_strength(hole_cards: tuple) -> float:
@@ -321,52 +452,47 @@ def _choose_action_impl(obs: Observation, memory: dict) -> Action:
 
 def _preflop_action(obs: Observation, memory: dict, rng: random.Random,
                     opp_stats: dict, pot_odds: float) -> Action:
-    """Preflop strategy based on hand strength features."""
-    strength = _preflop_strength(obs.hole_cards)
+    """Preflop strategy using neural network predicted showdown equity."""
+    equity = _predict_preflop_equity(obs.hole_cards)
 
-    # Position bonus: being on button (acting last post-flop) is valuable
+    # Position bonus: button acts last post-flop
     if obs.is_button:
-        strength += 0.05
+        equity += 0.04
 
-    # Adapt to opponent: if opponent folds a lot to raises, raise more
     fold_to_raise = opp_stats["fold_to_raise"]
 
-    # --- Premium hands (top ~15%): raise pot ---
-    if strength >= 0.55:
+    # --- Premium hands (top ~15%, equity >= 0.58): raise pot ---
+    if equity >= 0.58:
         if Action.RAISE_POT in obs.legal_actions:
             return Action.RAISE_POT
         if Action.RAISE_HALF in obs.legal_actions:
             return Action.RAISE_HALF
         return Action.CHECK_CALL
 
-    # --- Good hands (~15-35%): raise half or call ---
-    if strength >= 0.35:
-        # If opponent folds a lot, raise to steal
-        if fold_to_raise > 0.45 and Action.RAISE_HALF in obs.legal_actions:
+    # --- Strong hands (~15-35%, equity >= 0.52): raise half or call ---
+    if equity >= 0.52:
+        if fold_to_raise > 0.40 and Action.RAISE_HALF in obs.legal_actions:
             return Action.RAISE_HALF
-        if Action.RAISE_HALF in obs.legal_actions and rng.random() < 0.3:
+        if Action.RAISE_HALF in obs.legal_actions and rng.random() < 0.4:
             return Action.RAISE_HALF
         return Action.CHECK_CALL
 
-    # --- Marginal hands (~35-55%): call if cheap, fold if expensive ---
-    if strength >= 0.20:
+    # --- Playable hands (~35-60%, equity >= 0.45): call cheap bets ---
+    if equity >= 0.45:
         if obs.to_call <= obs.big_blind * 2:
             return Action.CHECK_CALL
-        # If opponent is very aggressive, tighten up
-        if opp_stats["agg_factor"] > 2.5 and obs.to_call > obs.big_blind * 3:
-            if Action.FOLD in obs.legal_actions:
-                return Action.FOLD
-        if obs.to_call <= obs.big_blind * 4:
+        # Facing larger raises: call if we have odds and decent equity
+        if obs.to_call <= obs.big_blind * 4 and equity >= 0.48:
             return Action.CHECK_CALL
         if Action.FOLD in obs.legal_actions:
             return Action.FOLD
         return Action.CHECK_CALL
 
-    # --- Weak hands (bottom ~55%): fold if facing a raise, otherwise check ---
+    # --- Weak hands (equity < 0.45): fold if bet into, check if free ---
     if obs.to_call == 0:
         return Action.CHECK_CALL
-    # Call the minimum blind if we're the button (just 1 chip to see a flop)
-    if obs.is_button and obs.to_call <= obs.big_blind and strength >= 0.12:
+    # Button discount: small blind only needs 1 chip to complete
+    if obs.is_button and obs.to_call <= (obs.big_blind // 2) and equity >= 0.38:
         return Action.CHECK_CALL
     if Action.FOLD in obs.legal_actions:
         return Action.FOLD
