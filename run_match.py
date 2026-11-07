@@ -11,6 +11,7 @@ Usage:
     python3 run_match.py --opponent calling     # CallingStation
     python3 run_match.py --opponent half        # AlwaysHalf
     python3 run_match.py --opponent pot         # AlwaysPot
+    python3 run_match.py --opponent value       # ValueBettor (bets river only with full house+)
     python3 run_match.py --deals 100            # custom number of deals
 """
 
@@ -27,6 +28,7 @@ OPPONENTS = {
     "calling": "baseline-bots/baseline_calling_station.py",
     "half": "baseline-bots/baseline_always_half.py",
     "pot": "baseline-bots/baseline_always_pot.py",
+    "value": "baseline-bots/baseline_value_bettor.py",
 }
 
 def main():

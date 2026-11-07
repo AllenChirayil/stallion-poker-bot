@@ -414,17 +414,24 @@ def _get_opp_stats(memory: dict) -> dict:
     prior_fold_to_raise = 1.8
     prior_faced_raise = 4.5
 
+    # Prior: roughly 1 bluff in 4 postflop-aggressive showdowns.
+    prior_bluffs = 1.0
+    prior_sd_raises = 4.0
+
     obs_vpip = memory.get("opp_vpip_count", 0)
     obs_pfr = memory.get("opp_pfr_count", 0)
     obs_raises = memory.get("opp_raise_count", 0)
     obs_calls = memory.get("opp_call_count", 0)
     obs_folds = memory.get("opp_fold_to_raise", 0)
     obs_faced = memory.get("opp_faced_raise", 0)
+    obs_bluffs = memory.get("opp_bluff_count", 0)
+    obs_sd_raises = memory.get("opp_showdown_raise_count", 0)
 
     vpip = (obs_vpip + prior_vpip) / (hands + 6)
     pfr = (obs_pfr + prior_pfr) / (hands + 6)
     agg_factor = (obs_raises + prior_raises) / max(obs_calls + prior_calls, 1.0)
     fold_to_raise = (obs_folds + prior_fold_to_raise) / max(obs_faced + prior_faced_raise, 1.0)
+    bluff_rate = (obs_bluffs + prior_bluffs) / (obs_sd_raises + prior_sd_raises)
     archetype = _detect_archetype(vpip, pfr, agg_factor, fold_to_raise)
 
     return {
@@ -432,39 +439,63 @@ def _get_opp_stats(memory: dict) -> dict:
         "pfr": pfr,
         "agg_factor": agg_factor,
         "fold_to_raise": fold_to_raise,
+        "bluff_rate": bluff_rate,
         "showdown_rate": memory.get("opp_showdown_count", 0) / max(hands, 1),
         "hands_seen": hands,
         "archetype": archetype,
     }
 
 
+_RAISES = (Action.RAISE_HALF, Action.RAISE_POT)
+
+
+def _start_hand_tracking(memory: dict, hand_index: int) -> None:
+    """Reset the per-hand flags used to build opponent statistics."""
+    memory["h_idx"] = hand_index
+    memory["h_processed"] = 0             # actions of this hand already scanned
+    memory["h_vpip"] = False              # opp voluntarily put chips in preflop
+    memory["h_pfr"] = False               # opp raised preflop
+    memory["h_opp_raised_postflop"] = False
+    memory["h_my_raise_pending"] = False  # our latest action was a raise the opp hasn't answered yet
+
+
 def _update_opponent_history(obs: Observation, memory: dict) -> None:
-    """Scan action history to record opponent betting patterns in real time."""
-    current_hand = obs.hand_index
-    last_processed = memory.get("last_processed_action_idx", -1)
-    last_hand = memory.get("last_processed_hand", -1)
+    """Scan new entries of this hand's action history for opponent tendencies.
 
-    if current_hand != last_hand:
-        last_processed = -1
-        memory["last_processed_hand"] = current_hand
+    VPIP/PFR are recorded as per-hand flags (committed in on_hand_end), so a
+    raise followed by a call counts once. Checks are not counted as calls.
+    "Faced a raise" is counted when the opponent answers one of our raises;
+    answers we never get to see (a fold, or a call that ends the action) are
+    resolved in on_hand_end from the hand result.
+    """
+    if memory.get("h_idx") != obs.hand_index:
+        _start_hand_tracking(memory, obs.hand_index)
 
-    for i in range(last_processed + 1, len(obs.action_history)):
-        act = obs.action_history[i]
-        if not act.is_me:
-            if act.action in (Action.RAISE_HALF, Action.RAISE_POT):
-                memory["opp_raise_count"] = memory.get("opp_raise_count", 0) + 1
-                if act.street == Street.PREFLOP:
-                    memory["opp_pfr_count"] = memory.get("opp_pfr_count", 0) + 1
-                    memory["opp_vpip_count"] = memory.get("opp_vpip_count", 0) + 1
-            elif act.action == Action.CHECK_CALL:
-                memory["opp_call_count"] = memory.get("opp_call_count", 0) + 1
-                if act.street == Street.PREFLOP and act.amount > 0:
-                    memory["opp_vpip_count"] = memory.get("opp_vpip_count", 0) + 1
-        else:
-            if act.action in (Action.RAISE_HALF, Action.RAISE_POT):
-                memory["opp_faced_raise"] = memory.get("opp_faced_raise", 0) + 1
+    history = obs.action_history
+    for i in range(memory["h_processed"], len(history)):
+        act = history[i]
+        if act.is_me:
+            memory["h_my_raise_pending"] = act.action in _RAISES
+            continue
 
-    memory["last_processed_action_idx"] = len(obs.action_history) - 1
+        if memory["h_my_raise_pending"]:
+            # The opponent answered our raise without folding.
+            memory["opp_faced_raise"] = memory.get("opp_faced_raise", 0) + 1
+            memory["h_my_raise_pending"] = False
+
+        if act.action in _RAISES:
+            memory["opp_raise_count"] = memory.get("opp_raise_count", 0) + 1
+            if act.street == Street.PREFLOP:
+                memory["h_vpip"] = True
+                memory["h_pfr"] = True
+            else:
+                memory["h_opp_raised_postflop"] = True
+        elif act.action == Action.CHECK_CALL and act.amount > 0:
+            memory["opp_call_count"] = memory.get("opp_call_count", 0) + 1
+            if act.street == Street.PREFLOP:
+                memory["h_vpip"] = True
+
+    memory["h_processed"] = len(history)
 
 
 # --------------------------------------------------------------------------
@@ -512,12 +543,21 @@ def choose_action(obs: Observation, memory: dict) -> Action:
     4. Position awareness: Leverage button advantage
     """
     try:
-        return _choose_action_impl(obs, memory)
+        action = _choose_action_impl(obs, memory)
     except Exception:
         # Safety net: never crash, always return a legal action
         if Action.CHECK_CALL in obs.legal_actions:
-            return Action.CHECK_CALL
-        return obs.legal_actions[0]
+            action = Action.CHECK_CALL
+        else:
+            action = obs.legal_actions[0]
+    try:
+        # Remember whether the opponent now faces our raise. If the hand ends
+        # before we act again, on_hand_end resolves it (fold vs. call).
+        if memory.get("h_idx") == obs.hand_index:
+            memory["h_my_raise_pending"] = action in _RAISES
+    except Exception:
+        pass
+    return action
 
 
 def _choose_action_impl(obs: Observation, memory: dict) -> Action:
@@ -624,6 +664,14 @@ def _river_action(obs: Observation, memory: dict, rng: random.Random,
 
     equity = _monte_carlo_equity(obs.hole_cards, obs.board, 120, rng,
                                  filter_opp_range=facing_bet)
+
+    # Showdown-informed adjustment. Our equity is measured against a RANDOM
+    # hand, and a random hand shows down two pair or worse ~25% of the time.
+    # An opponent whose postflop bets show up weaker than that is bluffing
+    # more than random (call lighter); one who shows up stronger is betting a
+    # strong range, so our random-hand equity is too optimistic (call tighter).
+    if facing_bet:
+        equity += max(-0.10, min(0.08, (opp_stats["bluff_rate"] - 0.25) * 0.4))
 
     # Cooler / reverse-implied-odds protection:
     # If holding non-nut flush or non-nut straight against a large bet, discount equity
@@ -809,12 +857,44 @@ def on_hand_end(result: HandResult, memory: dict) -> None:
         memory["hands_played"] = memory.get("hands_played", 0) + 1
         memory["opp_hands_seen"] = memory.get("opp_hands_seen", 0) + 1
 
+        opp_folded = (not result.went_to_showdown) and result.winner == "me"
+        # Per-hand flags only exist if we acted in this hand. If we never
+        # acted (we were big blind and the opponent folded the small blind),
+        # the opponent did not VPIP and did not face a raise.
+        tracked = memory.get("h_idx") == result.hand_index
+
+        if tracked:
+            if memory.get("h_vpip"):
+                memory["opp_vpip_count"] = memory.get("opp_vpip_count", 0) + 1
+            if memory.get("h_pfr"):
+                memory["opp_pfr_count"] = memory.get("opp_pfr_count", 0) + 1
+            if memory.get("h_my_raise_pending"):
+                # Our last raise was never answered in an observation we saw.
+                memory["opp_faced_raise"] = memory.get("opp_faced_raise", 0) + 1
+                if opp_folded:
+                    memory["opp_fold_to_raise"] = memory.get("opp_fold_to_raise", 0) + 1
+                else:
+                    # The hand reached showdown, so the opponent called.
+                    memory["opp_call_count"] = memory.get("opp_call_count", 0) + 1
+
+        if opp_folded:
+            memory["opp_fold_count"] = memory.get("opp_fold_count", 0) + 1
+
         if result.went_to_showdown:
             memory["opp_showdown_count"] = memory.get("opp_showdown_count", 0) + 1
-        elif result.winner == "me":
-            # Opponent folded
-            memory["opp_fold_count"] = memory.get("opp_fold_count", 0) + 1
-            memory["opp_fold_to_raise"] = memory.get("opp_fold_to_raise", 0) + 1
+            # Showdown cards: did the opponent bet/raise postflop with a weak hand?
+            if (tracked and memory.get("h_opp_raised_postflop")
+                    and result.opp_hole is not None and len(result.board) == 5):
+                memory["opp_showdown_raise_count"] = memory.get("opp_showdown_raise_count", 0) + 1
+                # A random PLO5 short-deck hand ends at two pair or worse ~24% of
+                # the time, which matches the 0.25 prior used in _get_opp_stats.
+                opp_cat = category_of(omaha_score(tuple(result.opp_hole), tuple(result.board)))
+                if opp_cat <= TWO_PAIR:
+                    memory["opp_bluff_count"] = memory.get("opp_bluff_count", 0) + 1
+
+        if tracked:
+            # Mark this hand's flags as consumed.
+            memory["h_idx"] = -1
 
     except Exception:
         pass  # Never crash in on_hand_end
