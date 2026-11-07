@@ -378,6 +378,26 @@ def _pot_odds(to_call: int, pot: int) -> float:
     return to_call / (pot + to_call)
 
 
+ARCH_UNKNOWN = 0
+ARCH_MANIAC = 1
+ARCH_STATION = 2
+ARCH_NIT = 3
+ARCH_EQUITY_BOT = 4
+
+
+def _detect_archetype(vpip: float, pfr: float, agg: float, fold_to_raise: float) -> int:
+    """Classify the opponent into a strategic archetype."""
+    if pfr > 0.50 and agg > 2.2:
+        return ARCH_MANIAC
+    if vpip > 0.70 and agg < 0.65 and fold_to_raise < 0.25:
+        return ARCH_STATION
+    if fold_to_raise > 0.45 or vpip < 0.35:
+        return ARCH_NIT
+    if 0.35 <= vpip <= 0.65 and 0.7 <= agg <= 2.2:
+        return ARCH_EQUITY_BOT
+    return ARCH_UNKNOWN
+
+
 # --------------------------------------------------------------------------
 # Opponent modeling with Bayesian smoothing
 # --------------------------------------------------------------------------
@@ -405,6 +425,7 @@ def _get_opp_stats(memory: dict) -> dict:
     pfr = (obs_pfr + prior_pfr) / (hands + 6)
     agg_factor = (obs_raises + prior_raises) / max(obs_calls + prior_calls, 1.0)
     fold_to_raise = (obs_folds + prior_fold_to_raise) / max(obs_faced + prior_faced_raise, 1.0)
+    archetype = _detect_archetype(vpip, pfr, agg_factor, fold_to_raise)
 
     return {
         "vpip": vpip,
@@ -413,6 +434,7 @@ def _get_opp_stats(memory: dict) -> dict:
         "fold_to_raise": fold_to_raise,
         "showdown_rate": memory.get("opp_showdown_count", 0) / max(hands, 1),
         "hands_seen": hands,
+        "archetype": archetype,
     }
 
 
@@ -515,8 +537,9 @@ def _choose_action_impl(obs: Observation, memory: dict) -> Action:
 
 def _preflop_action(obs: Observation, memory: dict, rng: random.Random,
                     opp_stats: dict, pot_odds: float) -> Action:
-    """Preflop strategy using neural network predicted showdown equity."""
+    """Preflop strategy using neural predicted equity with archetype exploitation."""
     equity = _predict_preflop_equity(obs.hole_cards)
+    archetype = opp_stats.get("archetype", ARCH_UNKNOWN)
 
     # Position bonus: button acts last post-flop
     if obs.is_button:
@@ -524,7 +547,12 @@ def _preflop_action(obs: Observation, memory: dict, rng: random.Random,
 
     fold_to_raise = opp_stats["fold_to_raise"]
 
-    # --- Premium hands (top ~15%, equity >= 0.58): raise pot ---
+    # --- ARCHETYPE EXPLOIT: Blind Stealing vs NITs & Guide-Clones ---
+    if archetype == ARCH_NIT and obs.is_button and obs.to_call <= obs.big_blind:
+        if equity >= 0.40 and Action.RAISE_HALF in obs.legal_actions:
+            return Action.RAISE_HALF
+
+    # --- Premium hands (equity >= 0.58): raise pot ---
     if equity >= 0.58:
         if Action.RAISE_POT in obs.legal_actions:
             return Action.RAISE_POT
@@ -544,7 +572,9 @@ def _preflop_action(obs: Observation, memory: dict, rng: random.Random,
     if equity >= 0.45:
         if obs.to_call <= obs.big_blind * 2:
             return Action.CHECK_CALL
-        # Facing larger raises: call if we have odds and decent equity
+        # Facing larger raises from a Maniac: call wider
+        if archetype == ARCH_MANIAC and obs.to_call <= obs.big_blind * 5 and equity >= 0.47:
+            return Action.CHECK_CALL
         if obs.to_call <= obs.big_blind * 4 and equity >= 0.48:
             return Action.CHECK_CALL
         if Action.FOLD in obs.legal_actions:
@@ -588,8 +618,10 @@ def _postflop_action(obs: Observation, memory: dict, rng: random.Random,
 def _river_action(obs: Observation, memory: dict, rng: random.Random,
                   opp_stats: dict, pot_odds: float,
                   my_score: int, category: int) -> Action:
-    """River strategy: complete board with blocker awareness and polarized bluffs."""
+    """River strategy: complete board with blocker awareness, polarized bluffs, and archetype exploits."""
     facing_bet = obs.to_call > 0
+    archetype = opp_stats.get("archetype", ARCH_UNKNOWN)
+
     equity = _monte_carlo_equity(obs.hole_cards, obs.board, 120, rng,
                                  filter_opp_range=facing_bet)
 
@@ -603,10 +635,9 @@ def _river_action(obs: Observation, memory: dict, rng: random.Random,
     if equity >= 0.78:
         memory["our_value_bet_count"] = memory.get("our_value_bet_count", 0) + 1
         if not facing_bet:
-            # Trap play: 10% slow-play check to protect checking range
             if rng.random() < 0.10:
                 return Action.CHECK_CALL
-            # Mixed sizing: 75% pot, 25% half-pot (unpredictable)
+            # Mixed sizing: 75% pot, 25% half-pot
             if rng.random() < 0.75 and Action.RAISE_POT in obs.legal_actions:
                 return Action.RAISE_POT
             if Action.RAISE_HALF in obs.legal_actions:
@@ -622,7 +653,9 @@ def _river_action(obs: Observation, memory: dict, rng: random.Random,
     # === Good hands (equity 0.55 - 0.78) ===
     if equity >= 0.55:
         if not facing_bet:
-            if Action.RAISE_HALF in obs.legal_actions and rng.random() < 0.65:
+            # Value bet: against stations, bet 100% of the time!
+            bet_freq = 0.95 if archetype == ARCH_STATION else 0.65
+            if Action.RAISE_HALF in obs.legal_actions and rng.random() < bet_freq:
                 return Action.RAISE_HALF
             return Action.CHECK_CALL
         else:
@@ -635,6 +668,9 @@ def _river_action(obs: Observation, memory: dict, rng: random.Random,
     # === Marginal hands (equity 0.35 - 0.55) ===
     if equity >= 0.35:
         if not facing_bet:
+            # Thin value against calling stations
+            if archetype == ARCH_STATION and equity >= 0.50 and Action.RAISE_HALF in obs.legal_actions:
+                return Action.RAISE_HALF
             return Action.CHECK_CALL
         if pot_odds < 0.30 and equity >= pot_odds:
             return Action.CHECK_CALL
@@ -644,11 +680,17 @@ def _river_action(obs: Observation, memory: dict, rng: random.Random,
 
     # === Weak hands (equity < 0.35): Polarized bluffs ===
     if not facing_bet:
-        if opp_stats["fold_to_raise"] > 0.35:
+        # NEVER bluff a calling station!
+        if archetype == ARCH_STATION:
+            return Action.CHECK_CALL
+
+        # Exploit Nits & Equity Bots that fold too much on river
+        bluff_threshold = 0.35 if archetype in (ARCH_NIT, ARCH_EQUITY_BOT) else 0.22
+        if opp_stats["fold_to_raise"] > 0.35 or archetype in (ARCH_NIT, ARCH_EQUITY_BOT):
             bluffs = memory.get("our_bluff_count", 0)
             value_bets = memory.get("our_value_bet_count", 0)
-            if value_bets > 0 and (bluffs / (bluffs + value_bets + 1)) < 0.30:
-                if rng.random() < 0.22:
+            if value_bets > 0 and (bluffs / (bluffs + value_bets + 1)) < 0.35:
+                if rng.random() < bluff_threshold:
                     memory["our_bluff_count"] = bluffs + 1
                     # 40% pot bluff, 60% half-pot bluff
                     if rng.random() < 0.40 and Action.RAISE_POT in obs.legal_actions:
@@ -658,10 +700,11 @@ def _river_action(obs: Observation, memory: dict, rng: random.Random,
         return Action.CHECK_CALL
 
     # Facing bet with weak hand: occasional check-raise bluff on cheap bets against chronic folders
-    if (obs.to_call <= obs.big_blind * 2 and
+    if (archetype in (ARCH_NIT, ARCH_EQUITY_BOT) and
+            obs.to_call <= obs.big_blind * 2 and
             opp_stats["fold_to_raise"] > 0.45 and
             Action.RAISE_HALF in obs.legal_actions and
-            rng.random() < 0.12):
+            rng.random() < 0.15):
         memory["our_bluff_count"] = memory.get("our_bluff_count", 0) + 1
         return Action.RAISE_HALF
 
@@ -673,15 +716,17 @@ def _river_action(obs: Observation, memory: dict, rng: random.Random,
 def _equity_based_action(obs: Observation, memory: dict, rng: random.Random,
                          opp_stats: dict, pot_odds: float,
                          equity: float) -> Action:
-    """Flop/Turn strategy with mixed bet sizing and deceptive checking."""
+    """Flop/Turn strategy with archetype exploitation, mixed sizing, and deceptive checks."""
     facing_bet = obs.to_call > 0
+    archetype = opp_stats.get("archetype", ARCH_UNKNOWN)
 
     # === Monster hands (equity >= 0.78) ===
     if equity >= 0.78:
         memory["our_value_bet_count"] = memory.get("our_value_bet_count", 0) + 1
         if not facing_bet:
-            # Trap play: 15% slow-play check to protect checking range and trap aggressive bots
-            if rng.random() < 0.15:
+            # Trap play: higher trap frequency against Maniacs to induce bluffs
+            trap_freq = 0.35 if archetype == ARCH_MANIAC else 0.15
+            if rng.random() < trap_freq:
                 return Action.CHECK_CALL
             # Mixed sizing: 70% pot, 30% half-pot
             if rng.random() < 0.70 and Action.RAISE_POT in obs.legal_actions:
@@ -699,15 +744,18 @@ def _equity_based_action(obs: Observation, memory: dict, rng: random.Random,
     # === Strong hands (equity 0.58 - 0.78) ===
     if equity >= 0.58:
         if not facing_bet:
-            # Value bet: mostly half-pot, 20% pot
+            # Max value against Calling Stations
+            if archetype == ARCH_STATION and Action.RAISE_HALF in obs.legal_actions:
+                return Action.RAISE_HALF
             if rng.random() < 0.20 and Action.RAISE_POT in obs.legal_actions:
                 return Action.RAISE_POT
             if Action.RAISE_HALF in obs.legal_actions and rng.random() < 0.75:
                 return Action.RAISE_HALF
             return Action.CHECK_CALL
         else:
-            if equity >= 0.68:
-                if Action.RAISE_POT in obs.legal_actions and rng.random() < 0.50:
+            # Re-raise aggressive bots when ahead
+            if equity >= 0.66:
+                if Action.RAISE_POT in obs.legal_actions and (archetype == ARCH_MANIAC or rng.random() < 0.50):
                     return Action.RAISE_POT
                 if Action.RAISE_HALF in obs.legal_actions:
                     return Action.RAISE_HALF
@@ -718,6 +766,10 @@ def _equity_based_action(obs: Observation, memory: dict, rng: random.Random,
     # === Drawing / Medium hands (equity 0.40 - 0.58) ===
     if equity >= 0.40:
         if not facing_bet:
+            # Continuation Bet / Float Steal vs Nits & Equity Bots!
+            if archetype in (ARCH_NIT, ARCH_EQUITY_BOT) and equity >= 0.42:
+                if Action.RAISE_HALF in obs.legal_actions and (obs.is_button or rng.random() < 0.45):
+                    return Action.RAISE_HALF
             if obs.is_button and Action.RAISE_HALF in obs.legal_actions and rng.random() < 0.30:
                 return Action.RAISE_HALF
             return Action.CHECK_CALL
@@ -731,6 +783,13 @@ def _equity_based_action(obs: Observation, memory: dict, rng: random.Random,
 
     # === Weak hands (equity < 0.40) ===
     if not facing_bet:
+        # C-Bet Steal against chronic folders / nits
+        if (archetype in (ARCH_NIT, ARCH_EQUITY_BOT) and
+                obs.is_button and
+                Action.RAISE_HALF in obs.legal_actions and
+                rng.random() < 0.30):
+            memory["our_bluff_count"] = memory.get("our_bluff_count", 0) + 1
+            return Action.RAISE_HALF
         if opp_stats["fold_to_raise"] > 0.40 and Action.RAISE_HALF in obs.legal_actions and rng.random() < 0.15:
             memory["our_bluff_count"] = memory.get("our_bluff_count", 0) + 1
             return Action.RAISE_HALF
