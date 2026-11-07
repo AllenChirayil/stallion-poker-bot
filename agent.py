@@ -293,17 +293,38 @@ def _preflop_strength(hole_cards: tuple) -> float:
 
 
 # --------------------------------------------------------------------------
+# Blocker and Nut Potential Awareness
+# --------------------------------------------------------------------------
+
+def _has_nut_blocker(hole_cards: tuple, board: tuple, category: int) -> bool:
+    """Check if we hold key nut blockers (e.g. Ace of flush suit or top straight cards)."""
+    if category == FLUSH:
+        from collections import Counter
+        board_suits = [c & 3 for c in board]
+        suit_counts = Counter(board_suits)
+        if not suit_counts:
+            return True
+        flush_suit = max(suit_counts, key=suit_counts.get)
+        ace_flush_card = (ACE << 2) | flush_suit
+        return ace_flush_card in hole_cards
+    elif category == STRAIGHT:
+        ranks = [c >> 2 for c in hole_cards]
+        return (ACE in ranks) or ((ACE - 1) in ranks)
+    return True
+
+
+# --------------------------------------------------------------------------
 # Monte Carlo equity estimation (post-flop)
 # --------------------------------------------------------------------------
 
 def _monte_carlo_equity(hole_cards: tuple, board: tuple, num_sims: int,
-                        rng: random.Random) -> float:
+                        rng: random.Random, filter_opp_range: bool = False) -> float:
     """Estimate win probability by dealing random opponent hands and
     completing the board, then comparing omaha_score.
 
-    Returns equity as a float 0.0 to 1.0.
+    If filter_opp_range is True (e.g. facing bets), filters out pure uncoordinated
+    trash without high cards or pairs so we don't over-estimate our equity.
     """
-    # Cards that are in play (known to us)
     used = set(hole_cards) | set(board)
     remaining = [c for c in range(NUM_CARDS) if c not in used]
     cards_to_deal_board = 5 - len(board)
@@ -314,13 +335,21 @@ def _monte_carlo_equity(hole_cards: tuple, board: tuple, num_sims: int,
     total = 0
 
     for _ in range(num_sims):
-        # We need: remaining board cards + 5 opponent hole cards
         needed = cards_to_deal_board + 5
         if needed > len(remaining):
             break
         sampled = rng.sample(remaining, needed)
         sim_board = board_list + sampled[:cards_to_deal_board]
         opp_hole = sampled[cards_to_deal_board:]
+
+        # Range filter: if opponent is betting, eliminate uncoordinated rags
+        if filter_opp_range:
+            opp_ranks = [c >> 2 for c in opp_hole]
+            if max(opp_ranks) < 6 and len(set(opp_ranks)) == 5:
+                # Resample once to draw from a stronger distribution
+                sampled = rng.sample(remaining, needed)
+                sim_board = board_list + sampled[:cards_to_deal_board]
+                opp_hole = sampled[cards_to_deal_board:]
 
         my_score = omaha_score(hole_cards, tuple(sim_board))
         opp_score = omaha_score(tuple(opp_hole), tuple(sim_board))
@@ -350,37 +379,70 @@ def _pot_odds(to_call: int, pot: int) -> float:
 
 
 # --------------------------------------------------------------------------
-# Opponent modeling
+# Opponent modeling with Bayesian smoothing
 # --------------------------------------------------------------------------
 
 def _get_opp_stats(memory: dict) -> dict:
-    """Return aggregated opponent statistics."""
+    """Return aggregated opponent statistics with Laplace Bayesian smoothing."""
     hands = memory.get("opp_hands_seen", 0)
-    if hands < 5:
-        # Not enough data, use defaults (assume slightly aggressive)
-        return {
-            "vpip": 0.65,           # Voluntary put in pot
-            "pfr": 0.35,            # Preflop raise %
-            "agg_factor": 1.5,      # (bets + raises) / calls
-            "fold_to_raise": 0.35,  # Fold when facing a raise
-            "showdown_rate": 0.35,  # Goes to showdown
-            "bluff_ratio": 0.3,     # Raises with losing hand at showdown
-            "enough_data": False,
-        }
+
+    # Informative Bayesian priors (equivalent to observing ~6 standard hands)
+    prior_vpip = 0.60 * 6
+    prior_pfr = 0.30 * 6
+    prior_raises = 4.0
+    prior_calls = 3.0
+    prior_fold_to_raise = 1.8
+    prior_faced_raise = 4.5
+
+    obs_vpip = memory.get("opp_vpip_count", 0)
+    obs_pfr = memory.get("opp_pfr_count", 0)
+    obs_raises = memory.get("opp_raise_count", 0)
+    obs_calls = memory.get("opp_call_count", 0)
+    obs_folds = memory.get("opp_fold_to_raise", 0)
+    obs_faced = memory.get("opp_faced_raise", 0)
+
+    vpip = (obs_vpip + prior_vpip) / (hands + 6)
+    pfr = (obs_pfr + prior_pfr) / (hands + 6)
+    agg_factor = (obs_raises + prior_raises) / max(obs_calls + prior_calls, 1.0)
+    fold_to_raise = (obs_folds + prior_fold_to_raise) / max(obs_faced + prior_faced_raise, 1.0)
 
     return {
-        "vpip": memory.get("opp_vpip_count", 0) / max(hands, 1),
-        "pfr": memory.get("opp_pfr_count", 0) / max(hands, 1),
-        "agg_factor": (memory.get("opp_raise_count", 0) /
-                       max(memory.get("opp_call_count", 1), 1)),
-        "fold_to_raise": (memory.get("opp_fold_to_raise", 0) /
-                          max(memory.get("opp_faced_raise", 1), 1)),
-        "showdown_rate": (memory.get("opp_showdown_count", 0) /
-                          max(hands, 1)),
-        "bluff_ratio": (memory.get("opp_bluff_count", 0) /
-                        max(memory.get("opp_showdown_raise_count", 1), 1)),
-        "enough_data": True,
+        "vpip": vpip,
+        "pfr": pfr,
+        "agg_factor": agg_factor,
+        "fold_to_raise": fold_to_raise,
+        "showdown_rate": memory.get("opp_showdown_count", 0) / max(hands, 1),
+        "hands_seen": hands,
     }
+
+
+def _update_opponent_history(obs: Observation, memory: dict) -> None:
+    """Scan action history to record opponent betting patterns in real time."""
+    current_hand = obs.hand_index
+    last_processed = memory.get("last_processed_action_idx", -1)
+    last_hand = memory.get("last_processed_hand", -1)
+
+    if current_hand != last_hand:
+        last_processed = -1
+        memory["last_processed_hand"] = current_hand
+
+    for i in range(last_processed + 1, len(obs.action_history)):
+        act = obs.action_history[i]
+        if not act.is_me:
+            if act.action in (Action.RAISE_HALF, Action.RAISE_POT):
+                memory["opp_raise_count"] = memory.get("opp_raise_count", 0) + 1
+                if act.street == Street.PREFLOP:
+                    memory["opp_pfr_count"] = memory.get("opp_pfr_count", 0) + 1
+                    memory["opp_vpip_count"] = memory.get("opp_vpip_count", 0) + 1
+            elif act.action == Action.CHECK_CALL:
+                memory["opp_call_count"] = memory.get("opp_call_count", 0) + 1
+                if act.street == Street.PREFLOP and act.amount > 0:
+                    memory["opp_vpip_count"] = memory.get("opp_vpip_count", 0) + 1
+        else:
+            if act.action in (Action.RAISE_HALF, Action.RAISE_POT):
+                memory["opp_faced_raise"] = memory.get("opp_faced_raise", 0) + 1
+
+    memory["last_processed_action_idx"] = len(obs.action_history) - 1
 
 
 # --------------------------------------------------------------------------
@@ -438,6 +500,7 @@ def choose_action(obs: Observation, memory: dict) -> Action:
 
 def _choose_action_impl(obs: Observation, memory: dict) -> Action:
     """Internal implementation of choose_action with full strategy."""
+    _update_opponent_history(obs, memory)
     rng = memory["rng"]
     opp_stats = _get_opp_stats(memory)
     pot_odds = _pot_odds(obs.to_call, obs.pot)
@@ -502,25 +565,22 @@ def _preflop_action(obs: Observation, memory: dict, rng: random.Random,
 def _postflop_action(obs: Observation, memory: dict, rng: random.Random,
                      opp_stats: dict, pot_odds: float) -> Action:
     """Post-flop strategy using equity estimation and opponent modeling."""
+    facing_bet = obs.to_call > 0
 
-    # Determine simulation budget based on street
-    # Total time bank: 8 seconds for 1000 hands, ~2-4 decisions per hand
-    # That's ~2-4ms per decision. omaha_score is very fast (dict lookup).
-    # Budget simulations carefully.
     if obs.street == Street.RIVER:
-        # On river, board is complete - use exact hand strength
         my_score = omaha_score(obs.hole_cards, obs.board)
         category = category_of(my_score)
         return _river_action(obs, memory, rng, opp_stats, pot_odds,
                              my_score, category)
 
-    # Flop or Turn: estimate equity via Monte Carlo
     if obs.street == Street.FLOP:
-        num_sims = 60   # ~0.3ms at ~5μs per sim
+        num_sims = 60
     else:  # TURN
-        num_sims = 80   # ~0.4ms, fewer unknown cards
+        num_sims = 80
 
-    equity = _monte_carlo_equity(obs.hole_cards, obs.board, num_sims, rng)
+    # If facing an aggressive bet, filter opponent range to realistic cards
+    equity = _monte_carlo_equity(obs.hole_cards, obs.board, num_sims, rng,
+                                 filter_opp_range=facing_bet)
 
     return _equity_based_action(obs, memory, rng, opp_stats, pot_odds, equity)
 
@@ -528,63 +588,83 @@ def _postflop_action(obs: Observation, memory: dict, rng: random.Random,
 def _river_action(obs: Observation, memory: dict, rng: random.Random,
                   opp_stats: dict, pot_odds: float,
                   my_score: int, category: int) -> Action:
-    """River strategy: board is complete, use exact hand strength."""
+    """River strategy: complete board with blocker awareness and polarized bluffs."""
+    facing_bet = obs.to_call > 0
+    equity = _monte_carlo_equity(obs.hole_cards, obs.board, 120, rng,
+                                 filter_opp_range=facing_bet)
 
-    # Estimate relative hand strength using a rough equity estimate
-    # On the river, we can also do a small number of simulations against
-    # random opponent hands to gauge our relative strength
-    equity = _monte_carlo_equity(obs.hole_cards, obs.board, 100, rng)
+    # Cooler / reverse-implied-odds protection:
+    # If holding non-nut flush or non-nut straight against a large bet, discount equity
+    if category in (FLUSH, STRAIGHT) and not _has_nut_blocker(obs.hole_cards, obs.board, category):
+        if obs.to_call > obs.big_blind * 3:
+            equity -= 0.08
 
-    # === Strong value hands (equity > 75%) ===
-    if equity >= 0.75:
+    # === Monster hands (equity >= 0.78) ===
+    if equity >= 0.78:
         memory["our_value_bet_count"] = memory.get("our_value_bet_count", 0) + 1
-        if Action.RAISE_POT in obs.legal_actions:
-            return Action.RAISE_POT
-        if Action.RAISE_HALF in obs.legal_actions:
-            return Action.RAISE_HALF
-        return Action.CHECK_CALL
-
-    # === Good hands (equity 55-75%) ===
-    if equity >= 0.55:
-        if obs.to_call == 0:
-            # We can bet for value
+        if not facing_bet:
+            # Trap play: 10% slow-play check to protect checking range
+            if rng.random() < 0.10:
+                return Action.CHECK_CALL
+            # Mixed sizing: 75% pot, 25% half-pot (unpredictable)
+            if rng.random() < 0.75 and Action.RAISE_POT in obs.legal_actions:
+                return Action.RAISE_POT
             if Action.RAISE_HALF in obs.legal_actions:
                 return Action.RAISE_HALF
             return Action.CHECK_CALL
-        # Facing a bet: call if pot odds are right
-        if equity >= pot_odds + 0.05:
+        else:
+            if Action.RAISE_POT in obs.legal_actions and equity >= 0.85:
+                return Action.RAISE_POT
+            if Action.RAISE_HALF in obs.legal_actions:
+                return Action.RAISE_HALF
             return Action.CHECK_CALL
-        if Action.FOLD in obs.legal_actions:
-            return Action.FOLD
-        return Action.CHECK_CALL
 
-    # === Marginal hands (equity 35-55%) ===
-    if equity >= 0.35:
-        if obs.to_call == 0:
-            # Check behind (pot control)
+    # === Good hands (equity 0.55 - 0.78) ===
+    if equity >= 0.55:
+        if not facing_bet:
+            if Action.RAISE_HALF in obs.legal_actions and rng.random() < 0.65:
+                return Action.RAISE_HALF
             return Action.CHECK_CALL
-        # Call small bets
+        else:
+            if equity >= pot_odds + 0.04:
+                return Action.CHECK_CALL
+            if Action.FOLD in obs.legal_actions:
+                return Action.FOLD
+            return Action.CHECK_CALL
+
+    # === Marginal hands (equity 0.35 - 0.55) ===
+    if equity >= 0.35:
+        if not facing_bet:
+            return Action.CHECK_CALL
         if pot_odds < 0.30 and equity >= pot_odds:
             return Action.CHECK_CALL
         if Action.FOLD in obs.legal_actions:
             return Action.FOLD
         return Action.CHECK_CALL
 
-    # === Weak hands (equity < 35%) ===
-    if obs.to_call == 0:
-        # Consider a bluff if opponent folds a lot
-        if (opp_stats["fold_to_raise"] > 0.40 and
-                Action.RAISE_HALF in obs.legal_actions):
+    # === Weak hands (equity < 0.35): Polarized bluffs ===
+    if not facing_bet:
+        if opp_stats["fold_to_raise"] > 0.35:
             bluffs = memory.get("our_bluff_count", 0)
             value_bets = memory.get("our_value_bet_count", 0)
-            # Keep a balanced bluff ratio (~30% of bets)
-            if value_bets > 0 and bluffs / (bluffs + value_bets + 1) < 0.35:
-                if rng.random() < 0.25:
+            if value_bets > 0 and (bluffs / (bluffs + value_bets + 1)) < 0.30:
+                if rng.random() < 0.22:
                     memory["our_bluff_count"] = bluffs + 1
-                    return Action.RAISE_HALF
+                    # 40% pot bluff, 60% half-pot bluff
+                    if rng.random() < 0.40 and Action.RAISE_POT in obs.legal_actions:
+                        return Action.RAISE_POT
+                    if Action.RAISE_HALF in obs.legal_actions:
+                        return Action.RAISE_HALF
         return Action.CHECK_CALL
 
-    # Facing a bet with a weak hand
+    # Facing bet with weak hand: occasional check-raise bluff on cheap bets against chronic folders
+    if (obs.to_call <= obs.big_blind * 2 and
+            opp_stats["fold_to_raise"] > 0.45 and
+            Action.RAISE_HALF in obs.legal_actions and
+            rng.random() < 0.12):
+        memory["our_bluff_count"] = memory.get("our_bluff_count", 0) + 1
+        return Action.RAISE_HALF
+
     if Action.FOLD in obs.legal_actions:
         return Action.FOLD
     return Action.CHECK_CALL
@@ -593,71 +673,70 @@ def _river_action(obs: Observation, memory: dict, rng: random.Random,
 def _equity_based_action(obs: Observation, memory: dict, rng: random.Random,
                          opp_stats: dict, pot_odds: float,
                          equity: float) -> Action:
-    """Flop/Turn strategy based on Monte Carlo equity."""
+    """Flop/Turn strategy with mixed bet sizing and deceptive checking."""
+    facing_bet = obs.to_call > 0
 
-    # === Very strong (equity > 70%): bet/raise for value ===
-    if equity >= 0.70:
+    # === Monster hands (equity >= 0.78) ===
+    if equity >= 0.78:
         memory["our_value_bet_count"] = memory.get("our_value_bet_count", 0) + 1
-        if obs.to_call == 0:
-            # Lead out with a strong hand
-            if Action.RAISE_POT in obs.legal_actions and equity >= 0.80:
+        if not facing_bet:
+            # Trap play: 15% slow-play check to protect checking range and trap aggressive bots
+            if rng.random() < 0.15:
+                return Action.CHECK_CALL
+            # Mixed sizing: 70% pot, 30% half-pot
+            if rng.random() < 0.70 and Action.RAISE_POT in obs.legal_actions:
                 return Action.RAISE_POT
             if Action.RAISE_HALF in obs.legal_actions:
                 return Action.RAISE_HALF
             return Action.CHECK_CALL
         else:
-            # Facing a bet with a strong hand: raise
-            if Action.RAISE_POT in obs.legal_actions and equity >= 0.80:
+            if rng.random() < 0.75 and Action.RAISE_POT in obs.legal_actions:
                 return Action.RAISE_POT
             if Action.RAISE_HALF in obs.legal_actions:
                 return Action.RAISE_HALF
             return Action.CHECK_CALL
 
-    # === Good drawing/made hand (equity 50-70%): bet or call ===
-    if equity >= 0.50:
-        if obs.to_call == 0:
-            # Semi-bluff or value bet
-            if Action.RAISE_HALF in obs.legal_actions:
-                if rng.random() < 0.55:
-                    return Action.RAISE_HALF
-            return Action.CHECK_CALL
-        # Facing a bet: call if equity > pot odds (with implied odds buffer)
-        implied_equity_needed = pot_odds * 0.85  # Give ourselves some implied odds credit
-        if equity >= implied_equity_needed:
-            return Action.CHECK_CALL
-        if Action.FOLD in obs.legal_actions:
-            return Action.FOLD
-        return Action.CHECK_CALL
-
-    # === Marginal hand (equity 30-50%): proceed carefully ===
-    if equity >= 0.30:
-        if obs.to_call == 0:
-            # Check (pot control) or occasional semi-bluff
-            if (obs.is_button and equity >= 0.40 and
-                    Action.RAISE_HALF in obs.legal_actions and
-                    rng.random() < 0.25):
+    # === Strong hands (equity 0.58 - 0.78) ===
+    if equity >= 0.58:
+        if not facing_bet:
+            # Value bet: mostly half-pot, 20% pot
+            if rng.random() < 0.20 and Action.RAISE_POT in obs.legal_actions:
+                return Action.RAISE_POT
+            if Action.RAISE_HALF in obs.legal_actions and rng.random() < 0.75:
                 return Action.RAISE_HALF
             return Action.CHECK_CALL
-        # Facing a bet: call only if price is right
-        if equity >= pot_odds and obs.to_call <= obs.pot * 0.5:
+        else:
+            if equity >= 0.68:
+                if Action.RAISE_POT in obs.legal_actions and rng.random() < 0.50:
+                    return Action.RAISE_POT
+                if Action.RAISE_HALF in obs.legal_actions:
+                    return Action.RAISE_HALF
+            elif Action.RAISE_HALF in obs.legal_actions and rng.random() < 0.30:
+                return Action.RAISE_HALF
             return Action.CHECK_CALL
-        if Action.FOLD in obs.legal_actions:
-            return Action.FOLD
-        return Action.CHECK_CALL
 
-    # === Weak hand (equity < 30%): mostly fold to bets ===
-    if obs.to_call == 0:
-        # Free check: take it, but occasionally semi-bluff
-        if (opp_stats["fold_to_raise"] > 0.45 and
-                Action.RAISE_HALF in obs.legal_actions and
-                rng.random() < 0.15):
+    # === Drawing / Medium hands (equity 0.40 - 0.58) ===
+    if equity >= 0.40:
+        if not facing_bet:
+            if obs.is_button and Action.RAISE_HALF in obs.legal_actions and rng.random() < 0.30:
+                return Action.RAISE_HALF
+            return Action.CHECK_CALL
+        else:
+            implied_needed = pot_odds * 0.90
+            if equity >= implied_needed and obs.to_call <= obs.pot * 0.6:
+                return Action.CHECK_CALL
+            if Action.FOLD in obs.legal_actions:
+                return Action.FOLD
+            return Action.CHECK_CALL
+
+    # === Weak hands (equity < 0.40) ===
+    if not facing_bet:
+        if opp_stats["fold_to_raise"] > 0.40 and Action.RAISE_HALF in obs.legal_actions and rng.random() < 0.15:
             memory["our_bluff_count"] = memory.get("our_bluff_count", 0) + 1
             return Action.RAISE_HALF
         return Action.CHECK_CALL
 
-    # Facing a bet with a weak hand
-    # Check if we have a draw worth chasing
-    if equity >= 0.20 and pot_odds < 0.25:
+    if equity >= 0.25 and pot_odds < 0.20 and obs.to_call <= obs.big_blind * 2:
         return Action.CHECK_CALL
 
     if Action.FOLD in obs.legal_actions:
@@ -673,15 +752,10 @@ def on_hand_end(result: HandResult, memory: dict) -> None:
 
         if result.went_to_showdown:
             memory["opp_showdown_count"] = memory.get("opp_showdown_count", 0) + 1
-
-        # We can't access the action_history from HandResult directly,
-        # but we tracked opponent actions during choose_action via obs.action_history.
-        # Use the result to track showdown-related stats.
-
-        if result.went_to_showdown and result.opp_hole is not None:
-            # Check if opponent was raising with a losing hand (bluff detection)
-            # This is tracked indirectly; for now just count showdowns
-            pass
+        elif result.winner == "me":
+            # Opponent folded
+            memory["opp_fold_count"] = memory.get("opp_fold_count", 0) + 1
+            memory["opp_fold_to_raise"] = memory.get("opp_fold_to_raise", 0) + 1
 
     except Exception:
         pass  # Never crash in on_hand_end
