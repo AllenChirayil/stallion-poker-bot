@@ -31,26 +31,38 @@ OPPONENTS = {
 
 def main():
     parser = argparse.ArgumentParser(description="Run a poker match between your bot and an opponent in one command.")
-    parser.add_argument("--opponent", choices=list(OPPONENTS.keys()), default="random",
-                        help="Which opponent to play against (default: random)")
+    parser.add_argument("--agent1", default="agent.py",
+                        help="Path to bot 1 script (default: agent.py)")
+    parser.add_argument("--opponent", default="random",
+                        help="Which opponent to play against: shortcut (random, calling, half, pot) OR path to any custom bot .py file")
     parser.add_argument("--deals", type=int, default=50,
                         help="Number of deals to play per half (default: 50)")
     parser.add_argument("--seed", type=int, default=7,
                         help="Match seed for deterministic cards (default: 7)")
     args = parser.parse_args()
 
-    opp_file = OPPONENTS[args.opponent]
+    if args.opponent in OPPONENTS:
+        opp_file = OPPONENTS[args.opponent]
+        opp_name = args.opponent.title()
+    else:
+        opp_file = args.opponent
+        opp_name = os.path.basename(args.opponent)
+
+    if not os.path.exists(opp_file):
+        print(f"Error: Opponent file '{opp_file}' not found.")
+        sys.exit(1)
+
     python_cmd = sys.executable
 
     print(f"\n==================================================")
-    print(f" Starting Match: Stallion vs {args.opponent.title()} ({args.deals} deals)")
+    print(f" Starting Match: {os.path.basename(args.agent1)} vs {opp_name} ({args.deals} deals)")
     print(f"==================================================")
 
     # Start bot 1 (Stallion) on port 5008
     env1 = os.environ.copy()
     env1["PORT"] = "5008"
     p1 = subprocess.Popen(
-        [python_cmd, "agent.py"],
+        [python_cmd, args.agent1],
         env=env1,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL
